@@ -1,4 +1,6 @@
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
+from sqlalchemy.orm import relationship
+
 from app.db.base_class import Base
 
 
@@ -18,3 +20,42 @@ class Tenant(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+    # Users belonging to this tenant
+    users = relationship(
+        "User",
+        back_populates="tenant",
+        cascade="all, delete",
+    )
+
+    # Products / catalog entries
+    products = relationship(
+        "Product",
+        back_populates="tenant",
+        cascade="all, delete-orphan",
+    )
+
+    # One row of automation settings for this tenant
+    automation_settings = relationship(
+        "AutomationSettings",
+        back_populates="tenant",
+        uselist=False,
+        cascade="all, delete",
+    )
+
+    # Call history for this tenant
+    calls = relationship(
+        "Call",
+        back_populates="tenant",
+        cascade="all, delete",
+    )
+
+    webhook_calls = relationship("WebhookCall", back_populates="tenant")
+
+    settings = relationship(
+        "TenantSettings",
+        back_populates="tenant",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+

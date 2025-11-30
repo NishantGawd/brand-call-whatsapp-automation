@@ -1,5 +1,5 @@
 from functools import lru_cache
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, AnyUrl
 import os
 from dotenv import load_dotenv
 
@@ -10,6 +10,14 @@ load_dotenv()
 class Settings(BaseModel):
     PROJECT_NAME: str = "Brand Call → WhatsApp Automation"
     API_V1_STR: str = "/api/v1"
+    CELERY_BROKER_URL: str = "redis://localhost:6379/0"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
+
+    # WhatsApp Cloud API base config (these are defaults for dev/testing)
+    WHATSAPP_API_BASE_URL: str = "https://graph.facebook.com/v17.0"
+    WHATSAPP_DEFAULT_PHONE_NUMBER_ID: str = ""
+    WHATSAPP_DEFAULT_ACCESS_TOKEN: str = ""
+    WHATSAPP_DEFAULT_FROM_NUMBER: str = ""  # e.g. "whatsapp:+91XXXXXXXXXX"
 
     # IMPORTANT: For dev, this points to your docker-compose Postgres
     DATABASE_URL: str = (

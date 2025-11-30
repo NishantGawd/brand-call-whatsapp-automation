@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global app styling */
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Segoe UI", sans-serif;
+  background-color: rgb(2 6 23); /* slate-950 */
+  color: rgb(226 232 240); /* slate-200 */
+}
+
+/* Smooth scrolling & nicer focus */
+html {
+  scroll-behavior: smooth;
+}
+
+*:focus-visible {
+  outline: 2px solid rgb(16 185 129); /* emerald-500 */
+  outline-offset: 2px;
+}
+
+/* Reusable card style */
+.app-card {
+  @apply rounded-2xl bg-slate-900/80 border border-slate-800/80 shadow-lg shadow-black/40;
+}
+
+/* Simple table styling */
+.app-table {
+  @apply w-full text-left text-sm;
+}
+
+.app-table thead {
+  @apply text-xs uppercase tracking-wide text-slate-400;
+}
+
+.app-table th {
+  @apply py-3 px-3 border-b border-slate-800/80 bg-slate-900/60;
+}
+
+.app-table td {
+  @apply py-2.5 px-3 border-b border-slate-800/40;
+}
+
+/* Scrollbar for dark theme (Webkit only, but fine for dev) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgb(51 65 85); /* slate-700 */
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(71 85 105); /* slate-600 */
+}

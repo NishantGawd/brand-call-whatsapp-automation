@@ -31,7 +31,8 @@ class User(Base):
         index=True,
     )
 
-    tenant = relationship("Tenant", backref="users")
+    # 👇 use back_populates instead of backref
+    tenant = relationship("Tenant", back_populates="users")
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(

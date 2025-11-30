@@ -12,7 +12,7 @@ router = APIRouter()
 def create_tenant(
     tenant_in: TenantCreate,
     db: Session = Depends(get_db_dep),
-) -> Tenant:
+) -> TenantModel:
     existing = (
         db.query(TenantModel)
         .filter(
@@ -40,6 +40,6 @@ def create_tenant(
 @router.get("/", response_model=list[Tenant])
 def list_tenants(
     db: Session = Depends(get_db_dep),
-) -> list[Tenant]:
+) -> list[TenantModel]:
     tenants = db.query(TenantModel).order_by(TenantModel.created_at.desc()).all()
     return tenants
