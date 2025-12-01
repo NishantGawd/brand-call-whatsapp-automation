@@ -1,149 +1,267 @@
-# app/api/v1/endpoints/webhooks_calls.py
-
-from fastapi import APIRouter, Depends, status, HTTPException
-from sqlalchemy.orm import Session
+# COMPLETE REWRITE - Removed JWT auth, added secret key verification
+import hmac
+import hashlib
 import logging
+from typing import Optional
+from datetime import datetime
+from fastapi import APIRouter, Request, HTTPException, Depends, Header, Query
+from sqlalchemy.orm import Session
 
-from app.core.deps import get_db, get_current_active_user
-from app.schemas.webhook import WebhookCallRequest
-from app.models.webhook_call import WebhookCall
-from app.models.tenant_settings import TenantSettings
+from app.api.deps import get_db
 from app.models.tenant import Tenant
-from app.services.automation_service import handle_call_automation
+from app.models.tenant_settings import TenantSettings
+from app.models.call import Call
+from app.models.webhook_call import WebhookCall
+from app.schemas.webhook import CallEndedEvent, WebhookResponse
+from app.tasks.whatsapp_tasks import process_call_ended_automation
 
-router = APIRouter()
 logger = logging.getLogger(__name__)
+router = APIRouter()
 
 
-@router.post("/calls/{tenant_slug}", status_code=status.HTTP_200_OK)
-def receive_call_webhook(
+def verify_webhook_signature(
+    payload: bytes,
+    signature: str,
+    secret_key: str,
+    provider: str = "generic"
+) -> bool:
+    """Verify webhook signature from telephony provider"""
+    if provider == "twilio":
+        # Twilio uses HMAC-SHA1
+        expected = hmac.new(
+            secret_key.encode(),
+            payload,
+            hashlib.sha1
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)
+    else:
+        # Generic HMAC-SHA256
+        expected = hmac.new(
+            secret_key.encode(),
+            payload,
+            hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)
+
+
+def normalize_call_status(status: str, provider: str) -> str:
+    """Normalize call status from different providers"""
+    status = status.lower()
+
+    # Map to standard statuses
+    if status in ["completed", "call-completed", "complete"]:
+        return "completed"
+    elif status in ["busy", "line-busy"]:
+        return "busy"
+    elif status in ["no-answer", "noanswer", "no_answer", "unanswered"]:
+        return "no-answer"
+    elif status in ["failed", "error", "call-failed"]:
+        return "failed"
+    elif status in ["canceled", "cancelled"]:
+        return "canceled"
+    else:
+        return status
+
+
+@router.post("/call-ended/{tenant_slug}", response_model=WebhookResponse)
+async def handle_call_ended_webhook(
     tenant_slug: str,
-    payload: WebhookCallRequest,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_active_user),
+    x_webhook_signature: Optional[str] = Header(None),
+    x_twilio_signature: Optional[str] = Header(None),
+    secret: Optional[str] = Query(None)  # Alternative: pass secret as query param
 ):
     """
-    Receive normalized call event and decide whether to trigger automation.
+    Webhook endpoint for telephony providers to notify when a call ends.
 
-    Steps:
-    1. Resolve tenant from slug and check access.
-    2. Load tenant automation settings.
-    3. Save call into WebhookCall table.
-    4. Evaluate automation conditions.
-    5. If conditions pass, enqueue WhatsApp send via Celery.
+    This endpoint does NOT require JWT authentication.
+    Security is handled via:
+    1. Webhook signature verification (if configured)
+    2. Secret key in query parameter (simpler alternative)
+    3. Tenant slug validation
     """
-    logger.info("📥 Incoming call webhook for %s: %s", tenant_slug, payload.json())
 
-    # 1) Resolve tenant from slug & check that the current user belongs to it
-    tenant: Tenant | None = (
-        db.query(Tenant)
-        .filter(Tenant.slug == tenant_slug)
-        .first()
-    )
+    # Get tenant by slug
+    tenant = db.query(Tenant).filter(
+        Tenant.slug == tenant_slug,
+        Tenant.is_active == True
+    ).first()
+
     if not tenant:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tenant not found.",
-        )
+        raise HTTPException(status_code=404, detail="Tenant not found")
 
-    if tenant.id != getattr(current_user, "tenant_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not allowed for this tenant.",
-        )
+    # Get tenant settings
+    settings = db.query(TenantSettings).filter(
+        TenantSettings.tenant_id == tenant.id
+    ).first()
 
-    # 2) Load tenant settings
-    settings: TenantSettings | None = (
-        db.query(TenantSettings)
-        .filter(TenantSettings.tenant_id == tenant.id)
-        .first()
-    )
     if not settings:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tenant settings not configured.",
-        )
+        raise HTTPException(status_code=400, detail="Tenant settings not configured")
 
-    logger.debug("Tenant %s settings: %s", tenant.id, settings)
+    # Verify webhook authenticity
+    signature = x_webhook_signature or x_twilio_signature
 
-    # 3) Persist call in DB
-    call = WebhookCall(
-        caller_number=payload.from_number,
-        call_status=payload.status,
-        call_duration_seconds=int(payload.duration_seconds or 0),
+    if settings.webhook_secret_key:
+        webhook_secret_key_str = str(settings.webhook_secret_key)
+
+        # If secret key is configured, verify it
+        if secret:
+            # Simple query param verification
+            if secret != webhook_secret_key_str:
+                logger.warning(f"Invalid webhook secret for tenant {tenant_slug}")
+                raise HTTPException(status_code=401, detail="Invalid webhook secret")
+        elif signature:
+            # Signature-based verification
+            body = await request.body()
+            provider = "twilio" if x_twilio_signature else "generic"
+            if not verify_webhook_signature(body, signature, webhook_secret_key_str, provider):
+                logger.warning(f"Invalid webhook signature for tenant {tenant_slug}")
+                raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        else:
+            logger.warning(f"No webhook authentication provided for tenant {tenant_slug}")
+            raise HTTPException(status_code=401, detail="Webhook authentication required")
+
+    # Parse webhook payload
+    content_type = request.headers.get("content-type", "")
+
+    if "application/json" in content_type:
+        payload = await request.json()
+    elif "application/x-www-form-urlencoded" in content_type:
+        form_data = await request.form()
+        payload = dict(form_data)
+    else:
+        payload = await request.json()
+
+    logger.info(f"Received webhook for tenant {tenant_slug}: {payload}")
+
+    # Determine provider and extract data
+    provider = "generic"
+    caller_phone = ""
+    receiver_phone = ""
+    call_sid = ""
+    call_status = ""
+    duration = None
+
+    # Twilio format
+    if "CallSid" in payload and "AccountSid" in payload:
+        provider = "twilio"
+        call_sid = str(payload.get("CallSid", ""))
+        caller_phone = str(payload.get("From", payload.get("Caller", "")))
+        receiver_phone = str(payload.get("To", payload.get("Called", "")))
+        call_status_raw = payload.get("CallStatus", "")
+        call_status = str(call_status_raw) if call_status_raw else ""
+        call_duration_raw = payload.get("CallDuration")
+        if call_duration_raw and str(call_duration_raw).isdigit():
+            duration = int(call_duration_raw)
+
+    # Exotel format
+    elif "CallSid" in payload and "Status" in payload:
+        provider = "exotel"
+        call_sid = str(payload.get("CallSid", ""))
+        caller_phone = str(payload.get("From", payload.get("CallFrom", "")))
+        receiver_phone = str(payload.get("To", payload.get("CallTo", "")))
+        status_raw = payload.get("Status", "")
+        call_status = str(status_raw) if status_raw else ""
+        dial_duration_raw = payload.get("DialCallDuration")
+        if dial_duration_raw and str(dial_duration_raw).isdigit():
+            duration = int(dial_duration_raw)
+
+    # Generic format
+    else:
+        call_sid = str(payload.get("call_id", payload.get("call_sid", str(datetime.utcnow().timestamp()))))
+        caller_phone = str(payload.get("caller", payload.get("from", payload.get("caller_phone", ""))))
+        receiver_phone = str(payload.get("receiver", payload.get("to", payload.get("receiver_phone", ""))))
+        status_raw = payload.get("status", "completed")
+        call_status = str(status_raw) if status_raw else "completed"
+        duration_raw = payload.get("duration", payload.get("duration_seconds"))
+        if duration_raw and str(duration_raw).isdigit():
+            duration = int(duration_raw)
+
+    # Normalize status
+    normalized_status = normalize_call_status(call_status, provider)
+
+    # Log the webhook call
+    webhook_log = WebhookCall(
         tenant_id=tenant.id,
+        provider=provider,
+        call_sid=call_sid,
+        caller_phone=caller_phone,
+        receiver_phone=receiver_phone,
+        status=normalized_status,
+        raw_payload=payload
+    )
+    db.add(webhook_log)
+    db.commit()
+
+    # Create call record
+    call = Call(
+        tenant_id=tenant.id,
+        caller_phone=caller_phone,
+        receiver_phone=receiver_phone,
+        call_sid=call_sid,
+        status=normalized_status,
+        duration_seconds=duration,
+        provider=provider,
+        ended_at=datetime.utcnow()
     )
     db.add(call)
     db.commit()
     db.refresh(call)
 
-    logger.info("📞 Call saved with ID=%s", getattr(call, "id", None))
+    call_id_int = int(call.id) if call.id else None
 
-    # Convert ORM attributes to plain Python types
-    call_id: int = int(getattr(call, "id", 0) or 0)
-    call_duration_seconds: int = int(
-        getattr(call, "call_duration_seconds", 0) or 0
+    # Trigger automation only for completed calls
+    automation_triggered = False
+
+    is_whatsapp_configured = bool(settings.is_whatsapp_configured)
+    is_settings_active = bool(settings.is_active)
+
+    if normalized_status == "completed" and caller_phone:
+        if is_whatsapp_configured and is_settings_active:
+            # Queue the automation task
+            delay_seconds = settings.message_delay_seconds or 5
+
+            process_call_ended_automation.apply_async(
+                args=[tenant.id, call_id_int, caller_phone],
+                countdown=delay_seconds
+            )
+
+            automation_triggered = True
+            logger.info(f"Queued automation for call {call_id_int}, delay: {delay_seconds}s")
+        else:
+            logger.info(f"Automation not configured/enabled for tenant {tenant.id}")
+    else:
+        logger.info(f"Call status '{normalized_status}' - automation not triggered")
+
+    return WebhookResponse(
+        success=True,
+        message=f"Webhook processed for {provider}",
+        call_id=call_id_int,
+        automation_triggered=automation_triggered
     )
 
-    # 4) Evaluate automation conditions
-    min_duration: int = int(
-        getattr(settings, "min_call_duration_seconds", 0) or 0
-    )
-    duration_valid: bool = call_duration_seconds >= min_duration
-    status_valid: bool = payload.status.lower() in {"completed", "answered", "done"}
-    settings_enabled: bool = bool(getattr(settings, "enabled", False))
 
-    logger.debug(
-        "🔍 Conditions → enabled=%s, duration_valid=%s, status_valid=%s "
-        "(min_duration=%s, call_duration=%s)",
-        settings_enabled,
-        duration_valid,
-        status_valid,
-        min_duration,
-        call_duration_seconds,
-    )
+@router.get("/test/{tenant_slug}")
+async def test_webhook_endpoint(
+    tenant_slug: str,
+    db: Session = Depends(get_db)
+):
+    """Test endpoint to verify webhook URL is accessible"""
+    tenant = db.query(Tenant).filter(Tenant.slug == tenant_slug).first()
 
-    if not (settings_enabled and duration_valid and status_valid):
-        logger.info("❌ Automation conditions NOT met for call ID=%s", call_id)
-        return {
-            "message": "Webhook processed, no automation triggered",
-            "call_id": call_id,
-            "automation_triggered": False,
-        }
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
 
-    # Optional: mark on the ORM object (not persisted if no column exists)
-    setattr(call, "should_trigger_automation", True)
-    logger.info("⚡ Automation WILL be triggered for call ID=%s", call_id)
-
-    # 5) Build WhatsApp recipient number
-    # Prefer customer_number, fall back to from_number
-    raw_to_number = payload.customer_number or payload.from_number
-    to_number: str = str(raw_to_number)
-    if to_number and not to_number.startswith("whatsapp:"):
-        to_number = f"whatsapp:{to_number}"
-
-    logger.debug("📤 Formatted WhatsApp number: %s", to_number)
-
-    # 6) Trigger automation task via Celery
-    try:
-        tenant_id_int = int(getattr(tenant, "id", 0) or 0)
-
-        automation_result = handle_call_automation(
-            tenant_id=tenant_id_int,    # ✅ pass plain int ID
-            call_id=call_id,
-            to_number=to_number,
-        )
-        logger.info("🎯 Automation queued: %s", automation_result)
-    except Exception as exc:
-        logger.exception("🔥 Error triggering automation for call ID=%s", call_id)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Automation error: {exc}",
-        )
+    settings = db.query(TenantSettings).filter(
+        TenantSettings.tenant_id == tenant.id
+    ).first()
 
     return {
-        "message": "Webhook processed successfully",
-        "call_id": call_id,
-        "automation_triggered": True,
-        "task": automation_result,
+        "status": "ok",
+        "tenant": tenant_slug,
+        "whatsapp_configured": settings.is_whatsapp_configured if settings else False,
+        "automation_active": settings.is_active if settings else False,
+        "webhook_url": f"/api/v1/webhooks/call-ended/{tenant_slug}",
+        "message": "Webhook endpoint is accessible. Configure your telephony provider to POST to this URL."
     }

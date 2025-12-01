@@ -1,6 +1,7 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
+# Updated to include settings relationship
+from sqlalchemy import Column, Integer, String, Boolean, DateTime
 from sqlalchemy.orm import relationship
-
+from sqlalchemy.sql import func
 from app.db.base_class import Base
 
 
@@ -9,53 +10,25 @@ class Tenant(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=False)
-    slug = Column(String(255), nullable=False, unique=True, index=True)
+    slug = Column(String(100), unique=True, index=True, nullable=False)
 
-    is_active = Column(Boolean, nullable=False, server_default="true")
-    setup_complete = Column(Boolean, nullable=False, server_default="false")
+    # Business Info
+    business_name = Column(String(255), nullable=True)
+    business_phone = Column(String(20), nullable=True)
+    business_email = Column(String(255), nullable=True)
+    business_address = Column(String(500), nullable=True)
 
+    # Status
+    is_active = Column(Boolean, default=True)
+    is_setup_complete = Column(Boolean, default=False)
+
+    # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    # Users belonging to this tenant
-    users = relationship(
-        "User",
-        back_populates="tenant",
-        cascade="all, delete",
-    )
-
-    # Products / catalog entries
-    products = relationship(
-        "Product",
-        back_populates="tenant",
-        cascade="all, delete-orphan",
-    )
-
-    # One row of automation settings for this tenant
-    automation_settings = relationship(
-        "AutomationSettings",
-        back_populates="tenant",
-        uselist=False,
-        cascade="all, delete",
-    )
-
-    # Call history for this tenant
-    calls = relationship(
-        "Call",
-        back_populates="tenant",
-        cascade="all, delete",
-    )
-
-    webhook_calls = relationship("WebhookCall", back_populates="tenant")
-
-    settings = relationship(
-        "TenantSettings",
-        back_populates="tenant",
-        uselist=False,
-        cascade="all, delete-orphan",
-    )
-
+    # Relationships
+    users = relationship("User", back_populates="tenant")
+    products = relationship("Product", back_populates="tenant")
+    calls = relationship("Call", back_populates="tenant")
+    settings = relationship("TenantSettings", back_populates="tenant", uselist=False)
+    automation_settings = relationship("AutomationSettings", back_populates="tenant", uselist=False)
